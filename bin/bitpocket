@@ -13,11 +13,14 @@ CFG_FILE="$DOT_DIR/config"
 TMP_DIR="$DOT_DIR/tmp"
 STATE_DIR="$DOT_DIR/state"
 LOCK_DIR="$TMP_DIR/lock"  # Use a lock directory for atomic locks. See the Bash FAQ http://mywiki.wooledge.org/BashFAQ/045
+PRE_HOOK="$DOT_DIR/pre-hook"
+POST_HOOK="$DOT_DIR/post-hook"
 
 # Default settings
 SLOW_SYNC_TIME=10
 SLOW_SYNC_FILE="$TMP_DIR/slow"
 RSYNC_RSH="ssh"
+BACKUPS="true"
 
 # Load config file
 [ -f "$CFG_FILE" ] && . "$CFG_FILE"
@@ -70,8 +73,8 @@ function init {
     exit 128
   fi
 
-  if [[ $# != 2 ]]; then
-    echo "usage: bitpocket init <REMOTE_HOST> <REMOTE_PATH>"
+  if [[ -z "$2" || -n "$3" ]]; then
+    echo "usage: bitpocket init {<REMOTE_HOST> | \"\"} <REMOTE_PATH>"
     exit 128
   fi
 
@@ -80,13 +83,20 @@ function init {
   cat <<EOF > "$CFG_FILE"
 ## Host and path of central storage
 REMOTE_HOST=$1
+REMOTE_HOST_FALLBACK=
 REMOTE_PATH="$2"
 
-## SSH command with options for connecting to \$REMOTE
+## file revisioning (everything other than "true" is considered "false")
+BACKUPS="true"
+
+## SSH command with options for connecting to \$REMOTE_HOST
 # RSYNC_RSH="ssh -p 22 -i $DOT_DIR/id_rsa"
 
 ## Uncomment following line to follow symlinks (transform it into referent file/dir)
 # RSYNC_OPTS="-L"
+
+## Use the following if a FAT or VFAT filesystem is being synchronized
+# RSYNC_OPTS="--no-perms --no-owner --no-group --modify-window=2"
 
 ## Uncomment following lines to get sync notifications
 # SLOW_SYNC_TIME=10
@@ -105,6 +115,7 @@ function log {
 
 # Do the actual synchronization
 function sync {
+  check_fallback_host
   assert_dotdir
   acquire_lock
   acquire_remote_lock
@@ -112,6 +123,8 @@ function sync {
   echo
   echo -e "\x1b\x5b1;32mbitpocket started\x1b\x5b0m at `date`."
   echo
+
+  pre_hook
 
   # Fire off slow sync start notifier in background
   on_slow_sync_start
@@ -123,7 +136,9 @@ function sync {
   # Save before-sync state
   # Must be done with rsync itself (rather than find) to respect includes/excludes
   # Order of includes/excludes/filters is EXTREMELY important
-  echo "# Saving current state and backing up files (if needed)"
+  [ "$BACKUPS" = "true" ] && echo "# Saving current state and backing up files (if needed)" \
+      || echo "# Saving current state"
+
   echo "  | Root dir: $(pwd)"   
   rsync -av --list-only --exclude "/$DOT_DIR" $RSYNC_OPTS $USER_RULES . | grep "^-\|^d" \
       | sed "s:^\S*\s*\S*\s*\S*\s*\S*\s*:/:" | sed "s:^/\.::" | sort > "$STATE_DIR/tree-current"
@@ -132,32 +147,33 @@ function sync {
   cp -f "$STATE_DIR/added-prev" "$TMP_DIR/fetch-exclude"
   sort "$STATE_DIR/tree-prev" "$STATE_DIR/tree-current" | uniq -u >> "$TMP_DIR/fetch-exclude"
 
-  # It is difficult to only create the backup directory if needed; instead
-  # we always create it, but remove it if it is empty afterwards.
-  mkdir --parents $DOT_DIR/backups/$TIMESTAMP
+  if [ "$BACKUPS" = "true" ]; then
+    # It is difficult to only create the backup directory if needed; instead
+    # we always create it, but remove it if it is empty afterwards.
+    mkdir --parents $DOT_DIR/backups/$TIMESTAMP
 
-  # Determine what will be fetched from server and make backup 
-  # copies of any local files to be deleted or overwritten.
-  # Order of includes/excludes/filters is EXTREMELY important
-  rsync --dry-run \
-        -auvzxi --delete $RSYNC_OPTS --exclude "/$DOT_DIR" --exclude-from "$TMP_DIR/fetch-exclude" $USER_RULES $REMOTE/ . \
-      | grep "^[ch<>\.\*][f]\|\*deleting" | sed "s:^\S*\s*::" | sed 's:\d96:\\\`:g' | sed "s:\(.*\):if [ -f \"\1\" ]; then cp --parents \"\1\" $DOT_DIR/backups/$TIMESTAMP; fi:" | sh || die "BACKUP"
-  [ "$(ls -A $DOT_DIR/backups/$TIMESTAMP)" ] && echo "  | Some files were backed up to $DOT_DIR/backups/$TIMESTAMP"
-  [ "$(ls -A $DOT_DIR/backups/$TIMESTAMP)" ] || rmdir $DOT_DIR/backups/$TIMESTAMP
+    # Determine what will be fetched from server and make backup 
+    # copies of any local files to be deleted or overwritten.
+    # Order of includes/excludes/filters is EXTREMELY important
+    rsync --dry-run -auvzxi --delete $RSYNC_OPTS --exclude "/$DOT_DIR" --exclude-from "$TMP_DIR/fetch-exclude" $USER_RULES "$REMOTE/" . \
+        | grep "^[ch<>\.\*][f]\|\*deleting" | sed "s:^\S*\s*::" | sed 's:\d96:\\\`:g' | sed "s:\(.*\):if [ -f \"\1\" ]; then cp --parents \"\1\" $DOT_DIR/backups/$TIMESTAMP; fi:" | sh || die "BACKUP"
+    [ "$(ls -A $DOT_DIR/backups/$TIMESTAMP)" ] && echo "  | Some files were backed up to $DOT_DIR/backups/$TIMESTAMP"
+    [ "$(ls -A $DOT_DIR/backups/$TIMESTAMP)" ] || rmdir $DOT_DIR/backups/$TIMESTAMP
+  fi
 
   # Actual fetch
   # Pulling changes from server
   # Order of includes/excludes/filters is EXTREMELY important
   echo
   echo "# Pulling changes from server"
-  rsync -auvzxi --delete $RSYNC_OPTS --exclude "/$DOT_DIR" --exclude-from "$TMP_DIR/fetch-exclude" $USER_RULES $REMOTE/ . | sed "s/^/  | /"  || die "PULL"
+  rsync -auvzxi --delete $RSYNC_OPTS --exclude "/$DOT_DIR" --exclude-from "$TMP_DIR/fetch-exclude" $USER_RULES "$REMOTE/" . | sed "s/^/  | /"  || die "PULL"
 
   # Actual push
   # Send new and updated, remotely remove files deleted locally
   # Order of includes/excludes/filters is EXTREMELY important
   echo
   echo "# Pushing changes to server"
-  rsync -auvzxi --delete $RSYNC_OPTS --exclude "/$DOT_DIR" $USER_RULES . $REMOTE/ | sed "s/^/  | /" || die "PUSH" 
+  rsync -auvzxi --delete $RSYNC_OPTS --exclude "/$DOT_DIR" $USER_RULES . "$REMOTE/" | sed "s/^/  | /" || die "PUSH" 
 
   # Save after-sync state
   # Must be done with rsync itself (rather than find) to respect includes/excludes
@@ -178,6 +194,7 @@ function sync {
   on_slow_sync_stop
 
   cleanup
+  post_hook
   echo
   echo -e "\x1b\x5b1;32mbitpocket finished\x1b\x5b0m at `date`."
   echo
@@ -298,7 +315,7 @@ function acquire_remote_lock {
   $REMOTE_RUNNER "mkdir -p \"$REMOTE_TMP_DIR\"; cd \"$REMOTE_PATH\" && mkdir \"$LOCK_DIR\" 2>/dev/null"
 
   if [[ $? != 0 ]]; then
-    echo "Couldn't acquire remote lock. Another client is syncing with $REMOTE or lock file couldn't be created. Exiting."
+    echo "Couldn't acquire remote lock. Another client is syncing with \"$REMOTE\" or lock file couldn't be created. Exiting."
     release_lock
     exit 3
   fi
@@ -345,7 +362,8 @@ function list {
 }
 
 function usage {
-  echo "usage:  bitpocket [sync|help|pack|log|cron|list|init <REMOTE_HOST> <REMOTE_PATH>]"
+  echo "usage:  bitpocket [sync | help | pack | log | cron | list]"
+  echo "        bitpocket init {<REMOTE_HOST> | \"\"} <REMOTE_PATH>"
   echo ""
   echo "Available commands:"
   echo "   sync    Run the sync process. If no command is specified, sync is run by default."
@@ -362,9 +380,36 @@ function usage {
 
 }
 
+function check_fallback_host {
+  if [ -n "$REMOTE_HOST_FALLBACK" ]; then
+    echo "checking fallback host"
+    $REMOTE_RUNNER "echo \"check\" &>/dev/null"
+
+    if [ $? -ne 0 ]; then
+      echo "could not contact $REMOTE_HOST fallback $REMOTE_HOST_FALLBACK enabled"
+      REMOTE_RUNNER="$RSYNC_RSH $REMOTE_HOST_FALLBACK"
+      REMOTE="$REMOTE_HOST_FALLBACK:$REMOTE_PATH"
+    fi
+  fi
+}
+
+function pre_hook {
+  if [ -f "$PRE_HOOK" ]; then
+    echo "# Running pre-hook script"
+    $PRE_HOOK | sed "s/^/  | /"
+  fi
+}
+
+function post_hook {
+  if [ -f "$POST_HOOK" ]; then
+    echo "# Running post-hook script"
+    $POST_HOOK | sed "s/^/  | /"
+  fi
+}
+
 if [ "$1" = "init" ]; then
   # Initialize bitpocket directory
-  init $2 $3 $4
+  init "$2" "$3" "$4"
 elif [ "$1" = "pack" ]; then
   # Pack backups using git
   pack
